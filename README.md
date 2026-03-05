@@ -1,42 +1,119 @@
 # NixOS Module Library
 
-A collection of reusable, declarative NixOS modules for building modular system configurations. This library provides battle-tested modules for networking, services, desktops, applications, and hardware profiles.
+Reusable NixOS modules for managing a segmented home network with VLAN isolation, policy-based VPN routing, zone-based firewalling, and a self-hosted media/services stack. Built on systemd-networkd and nftables throughout.
 
-## Overview
+## Architecture
 
-This repository provides NixOS modules that can be imported into your flake-based NixOS configurations. Each module is designed to be self-contained, well-documented, and follows NixOS best practices.
+```
+module-library/
+├── network-spec.nix          # Single source of truth for all IPs, VLANs, DNS
+├── profiles/                 # Composed module sets (workstation, server-vm, etc.)
+├── services/
+│   ├── client/
+│   │   ├── networking/       # OpenVPN (policy routing), WireGuard, interface modules
+│   │   └── fileshare/        # NFS + VirtioFS client mounts
+│   └── server/
+│       ├── networking/       # nftables, Kea DHCP, Unbound DNS, WireGuard server
+│       ├── media/            # Jellyfin, Sonarr, Radarr, Prowlarr, qBittorrent
+│       ├── web/              # Traefik reverse proxy, ttyd web terminal
+│       ├── fileshare/        # NFS + SMB servers
+│       ├── devops/           # Gitea
+│       ├── gaming/           # FoundryVTT
+│       └── virt/             # libvirt/QEMU via NixVirt
+├── desktops/                 # Sway (Wayland), GNOME, headless
+├── apps/                     # GUI + TUI application bundles
+└── hardware/                 # Profiles (desktop, laptop, server, VM guest, RPi)
+```
+
+### Network Specification
+
+`network-spec.nix` is a pure data file that acts as an IP address registry. Every VLAN, subnet, gateway, host IP, WireGuard network, and DNS record is defined here once, then consumed by host configs via `lib.networkSpec`. No IP address is hardcoded anywhere else.
+
+## Key Modules
+
+### OpenVPN with Policy Routing (`services/client/networking/openvpn.nix`)
+
+Routes specific source IPs through a VPN tunnel while leaving everything else on the WAN. Designed for pushing *arr/torrent traffic through a commercial VPN without affecting the rest of the network.
+
+How it works:
+
+1. **nftables prerouting** marks new connections from configured source IPs with a fwmark
+2. **Kernel policy routing** (ip rule) sends marked packets to a dedicated routing table
+3. **Route-up script** copies LAN routes into the VPN table so return traffic still reaches local hosts
+4. **Kill switch** via nftables output chain blocks VPN sources from reaching the WAN directly if the tunnel drops
+5. **ct mark restoration** ensures reply packets for existing connections stay in the VPN table
+6. **`src_valid_mark=1`** sysctl makes reverse path filtering work with policy routing
+
+```nix
+services.client.networking.openvpn.servers.provider = {
+  configFile = ./provider.ovpn;
+  policyRouting = {
+    enable = true;
+    fwmark = 100;
+    vpnSources = [ "10.88.20.11" ];  # services1 media IP
+    wanInterface = "wan";
+  };
+};
+```
+
+### Zone-Based Firewall (`services/server/networking/nftables.nix`)
+
+nftables firewall with named security zones mapped to interface sets:
+
+- **trusted** (infra VLAN) -- full access
+- **client** (wifi/cabled) -- internet + selected services
+- **iot** (IoT VLANs) -- outbound-only, no lateral movement
+- **vpn-client** (WireGuard peers) -- routed through to LAN
+
+Each zone gets interface and IP sets auto-generated from configuration. Rules reference zones by name rather than raw interfaces. Supports per-zone SSH rate limiting, MAC-based device whitelisting, and ICMP rate limiting.
+
+### WireGuard Server (`services/server/networking/wireguard.nix`)
+
+Dual-tunnel WireGuard setup:
+
+- **Point-to-Site** (port 51820) -- phones, laptops connecting remotely
+- **Site-to-Site** (port 51821) -- inter-router tunnels between locations
+
+Both use systemd-networkd netdevs (not the NixOS `networking.wireguard` module) for tighter integration with the rest of the network stack. DNS queries from WireGuard peers are forwarded to the router's Unbound instance.
+
+### DHCP + DNS (`services/server/networking/kea.nix`, `unbound.nix`)
+
+- **Kea DHCP4** serves per-VLAN pools with subnet-specific DNS domains
+- **Unbound** provides recursive DNS with local zones for internal hosts, wildcard subdomains for the services VM, and upstream DNS-over-TLS
+
+### Interface Modules (`services/client/networking/iface-*.nix`)
+
+Four interface modules cover every combination of VLAN/native and DHCP/static. All use systemd-networkd with options for interface renaming, MAC matching, multiple addresses, forwarding, and WoL. A separate trunk module handles the tagged uplink.
+
+### Media Stack (`services/server/media/`)
+
+Thin wrappers around upstream NixOS modules with a shared `media-common` module that creates a unified media group and directory structure (`/storage/media/{movies,tv,downloads}`). Individual modules: Jellyfin, Sonarr, Radarr, Prowlarr, Jellyseerr, qBittorrent.
+
+### Profiles
+
+Pre-composed module sets for common roles:
+
+| Profile | Includes |
+|---------|----------|
+| `profile-workstation` | Sway + desktop hardware + all GUI/TUI apps + bluetooth |
+| `profile-server-vm` | Headless + VM guest hardware + TUI apps |
+| `profile-server-physical` | Headless + server hardware + TUI apps |
+| `profile-storage-nfs` | NFS client mounts (backups, data, media) |
+| `profile-storage-virtiofs` | VirtioFS client mounts for VMs |
 
 ## Usage
 
-### Adding as a Flake Input
-
-Add this repository as an input to your `flake.nix`:
-
 ```nix
 {
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    module-library = {
-      url = "path:/storage/data/code/system-flake-repos/module-library";
-      # or use git:
-      # url = "git+https://your-repo-url/module-library";
-    };
-  };
+  inputs.module-library.url = "github:srifm1/module-library-public";
 
-  outputs = { self, nixpkgs, module-library }: {
+  outputs = { nixpkgs, module-library, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
       modules = [
-        # Apply the overlay for custom packages
         { nixpkgs.overlays = [ module-library.overlays.default ]; }
-
-        # Import composition profiles
-        module-library.nixosModules.profile-workstation
-
-        # Import individual modules as needed
-        module-library.nixosModules.hw-laptop
-
-        # Your host-specific configuration
+        module-library.nixosModules.profile-server-vm
+        module-library.nixosModules.nftables
+        module-library.nixosModules.kea
         ./hosts/myhost
       ];
     };
@@ -44,169 +121,8 @@ Add this repository as an input to your `flake.nix`:
 }
 ```
 
-### Example Host Configuration
-
-```nix
-# hosts/myhost/default.nix
-{ config, lib, pkgs, ... }:
-
-{
-  imports = [
-    ./hardware-configuration.nix
-  ];
-
-  # Configure modules imported from the library
-  desktops.gnome = {
-    enable = true;
-    username = "myuser";
-  };
-
-  # Host-specific settings
-  networking.hostName = "myhost";
-  system.stateVersion = "24.05";
-}
-```
-
-## Module Categories
-
-### Network Interfaces
-
-Modules for configuring network interfaces with various topologies:
-
-- `iface-dhcp-native` - DHCP on native (untagged) interface
-- `iface-dhcp-vlan` - DHCP on VLAN-tagged interface
-- `iface-static-native` - Static IP on native interface
-- `iface-static-vlan` - Static IP on VLAN-tagged interface
-- `iface-trunk` - Trunk interface for carrying multiple VLANs
-
-### Client Services
-
-Modules for client-side services:
-
-**Networking:**
-- `openvpn-client` - OpenVPN client configuration (`services.client.networking.openvpn`)
-- `wireguard-client` - WireGuard VPN client (`services.client.networking.wireguard`)
-
-**File Sharing:**
-- `nfs-client` - NFS client mounts (`services.client.fileshare.nfs`)
-- `virtiofs-client` - VirtioFS client mounts (`services.virtiofs-client`)
-
-### Server Services
-
-Modules for server-side services (options under `services.<name>-server`):
-
-**Networking:**
-- `kea` - ISC Kea DHCP server (`services.kea-server`)
-- `unbound` - Unbound DNS resolver (`services.unbound-server`)
-- `nftables` - nftables firewall (`services.nftables-firewall`)
-- `wireguard-server` - WireGuard VPN server (`services.wireguard-server`)
-
-**File Sharing:**
-- `nfs-server` - NFS file server (`services.nfs-server`)
-- `smb-server` - Samba/SMB file server (`services.smb-server`)
-
-**Web:**
-- `traefik` - Traefik reverse proxy (`services.traefik-server`)
-- `ttyd` - ttyd web terminal (`services.ttyd-server`)
-
-**Media:**
-- `media-common` - Shared media service config (`services.media-common`)
-- `jellyfin` - Jellyfin media server (`services.jellyfin-server`)
-- `sonarr` - Sonarr TV management (`services.sonarr-server`)
-- `radarr` - Radarr movie management (`services.radarr-server`)
-- `prowlarr` - Prowlarr indexer (`services.prowlarr-server`)
-- `jellyseerr` - Jellyseerr request management (`services.jellyseerr-server`)
-- `qbittorrent` - qBittorrent download client (`services.qbittorrent-server`)
-
-**Gaming:**
-- `foundryvtt` - Foundry VTT game server (`services.foundryvtt-server`)
-
-**DevOps:**
-- `gitea` - Gitea git forge (`services.gitea-server`)
-
-**Automation:**
-- `home-assistant` - Home Assistant (`services.hass-server`)
-
-**Other:**
-- `ssh` - SSH server configuration (`services.ssh-server`)
-
-### Virtualization
-
-- `nixvirt-host` - libvirtd/QEMU host with NixVirt integration
-
-### Desktops
-
-Desktop environment modules:
-
-- `gnome` - GNOME desktop environment
-- `sway` - Sway (Wayland) window manager
-- `headless` - Headless system (no GUI)
-
-### Applications
-
-Application bundles organized by interface type:
-
-**GUI Applications:**
-- `apps-gui-core` - Essential GUI applications
-- `apps-gui-dev` - Development tools with GUI
-- `apps-gui-gaming` - Gaming applications
-- `apps-gui-productivity` - Productivity applications
-
-**TUI Applications:**
-- `apps-tui-core` - Essential terminal applications
-- `apps-tui-dev` - Terminal-based development tools
-- `apps-tui-productivity` - Terminal productivity tools
-
-### Hardware
-
-Hardware-specific configurations:
-
-**Discrete Hardware:**
-- `bluetooth` - Bluetooth support
-- `nvidia` - NVIDIA graphics drivers
-- `vial` - Vial keyboard configuration
-
-**Hardware Profiles:**
-- `hw-desktop` - Desktop PC profile
-- `hw-guest` - Virtual machine guest profile
-- `hw-laptop` - Laptop profile (power management, etc.)
-- `hw-rpi` - Raspberry Pi profile
-- `hw-server` - Server profile (headless, optimized)
-
-### Composition Profiles
-
-Pre-composed module sets for common configurations:
-
-- `profile-workstation` - Desktop/laptop with sway, GUI+TUI apps, bluetooth
-- `profile-server-vm` - Headless VM server with TUI apps
-- `profile-server-physical` - Headless physical server with TUI apps
-- `profile-storage-nfs` - NFS storage client (backups, data, media mounts)
-- `profile-storage-virtiofs` - VirtioFS storage client for VMs
-
-### Network Specification
-
-The library exports `lib.networkSpec` - a single source of truth for all network topology, IP assignments, VLAN definitions, WireGuard configuration, and DNS records.
-
-## Module Design
-
-All modules in this library follow these principles:
-
-1. **Declarative Options**: Server modules expose options under `services.<name>-server`, client modules under `services.client.<category>.<name>` or `services.<name>-client`
-2. **Enable Guards**: Modules are disabled by default and must be explicitly enabled
-3. **Self-Contained**: Modules include all necessary package dependencies and configurations
-4. **Well-Documented**: Each option includes descriptions and type information
-5. **Composable**: Modules can be combined without conflicts
-
-## Contributing
-
-When adding new modules:
-
-1. Place the module in the appropriate category directory
-2. Follow the existing module structure and naming conventions
-3. Add the module export to `flake.nix`
-4. Update this README with the module description
-5. Ensure the module has proper option documentation
+`lib.networkSpec` is available to consuming flakes for referencing the network topology.
 
 ## License
 
-This module library is provided as-is for use in NixOS configurations.
+MIT
